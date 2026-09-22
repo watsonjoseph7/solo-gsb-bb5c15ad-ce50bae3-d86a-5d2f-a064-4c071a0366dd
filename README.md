@@ -10,10 +10,17 @@
 用**进入/恢复双阈值构成的滞回带**加**连续次数**消除边界抖动，并支持当前告警查询与
 进入/恢复事件的历史分页。
 
+此外，本服务支持**跨来源复合告警**：创建规则时声明 2～4 个来源及各自的方向、阈值、
+可选 `value_key` 和 `window_seconds`；系统在归并后的已发布流上按合并顺序维护每个
+条件的**最近命中**，只有当所有条件的最近命中都落在同一个事件时间窗口内时才产生一次
+`correlated_entered` 事件，任一条件超窗即回到等待状态。
+
 - 语言/框架：Python 3.11 · FastAPI · Uvicorn
 - 存储：SQLite（WAL 模式，单文件，零外部依赖）
 - 并发：写操作在 `BEGIN IMMEDIATE` 事务内串行化，水位线推进单调、发布只发生一次，
   告警状态与发布在同一事务内推进
+- 迁移：建库与版本化迁移（`PRAGMA user_version`）在应用启动时自动完成，
+  旧版本数据库启动即自动升级、数据保留
 
 ## 单条命令启动
 
@@ -29,7 +36,7 @@ docker compose up --build
 - 健康检查：`http://localhost:8000/health`
 
 数据库文件在容器内 `/data/sensors.db`，由 compose 命名卷 `sensor-data` 持久化；
-建库与建表在应用启动时（FastAPI lifespan）自动完成，无需手动初始化。
+建库、建表与版本化迁移在应用启动时（FastAPI lifespan）自动完成，无需手动初始化。
 停止并清理：`docker compose down`（加 `-v` 同时删除数据卷）。
 
 ## 必要配置
@@ -47,7 +54,7 @@ docker compose up --build
 ```bash
 python3 -m pip install -r requirements.txt
 SENSOR_DB_PATH=./sensors.db uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行 49 个端到端行为测试（需 pytest、httpx）
+pytest -q        # 运行 75 个端到端行为测试（需 pytest、httpx）
 ```
 
 ## 时间线语义
@@ -86,6 +93,27 @@ pytest -q        # 运行 49 个端到端行为测试（需 pytest、httpx）
   完全一致。
 - 数值来源：读数 `value` 本身是数字时直接比较；创建规则时给 `value_key`（如 `"temp"`）则从
   对象型读数的该顶层键取值。
+
+## 复合告警语义（跨来源相关）
+
+每条复合规则绑定会话内 **2～4 个不同来源**的条件（各自独立的方向/阈值/可选 `value_key`），
+并声明事件时间窗口 `window_seconds`。状态机消费**归并后的已发布流**，按确定顺序
+`(observed_at, source_id, seq)` 逐条推进两个状态（`waiting` ⇄ `correlated`）：
+
+- **命中（hit）**：某来源的已发布读数严格越过其条件阈值（`above` 为 `value > threshold`，
+  `below` 为 `value < threshold`，等于阈值不算）时，该条件的“最近命中”更新为这条读数；
+  未越限的读数不会清除已有命中，命中只通过时间窗口过期。非数值、缺失键的读数不构成命中。
+- **进入**：每当处理完一条已发布读数后检查——若**所有**条件都有最近命中，且最早与最晚命中
+  之差 `max − min ≤ window_seconds`（含边界），则从 `waiting` 进入 `correlated` 并产生
+  **恰好一次** `correlated_entered` 事件，事件快照记录各条件当时的命中读数与窗口边界。
+- **超窗回退**：处于 `correlated` 时，新命中使最早/最晚命中跨度超过窗口即**静默**回到
+  `waiting`（不产生事件）；之后各条件重新对齐会再产生一次新的 `correlated_entered`。
+- **恰好一次**：每条读数只发布一次、每条规则按归并流位置只消费一次，重复上报（幂等空操作）
+  不会重复产生事件；数据库层另有 `UNIQUE(rule_id, window_end)` 兜底。
+- **只有确定发布的读数才参与**：缓冲中的读数不参与；迟到被隔离的读数状态永远是
+  `quarantined`，绝不会构成命中或补造事件。
+- **晚建规则等价回放**：创建规则时立即按归并顺序回放相关来源此前全部已发布读数，
+  因此无论规则何时创建，其当前命中、状态与历史事件都与“一开始就建好”完全一致。
 
 ## 接口
 
@@ -233,6 +261,92 @@ curl -s 'localhost:8000/sessions/lab-1/alerts/current'
 curl -s 'localhost:8000/sessions/lab-1/alerts/history?limit=20&event_type=entered'
 ```
 
+### 10. 创建复合告警规则
+
+`POST /sessions/{session_id}/correlation-rules`
+
+为会话内 **2～4 个不同来源**创建跨来源复合规则。请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `conditions` | 2～4 个条件（少于 2 或多于 4 → 422），来源必须互不相同（重复 → 422） |
+| `conditions[].source_id` | 会话 `source_ids` 之一；未知来源 → 400 |
+| `conditions[].direction` | `above`（高于阈值越限）或 `below`（低于阈值越限），严格比较 |
+| `conditions[].threshold` | 越限阈值（有限数值） |
+| `conditions[].value_key` | 可选；从对象型读数中取该顶层键比较，省略则直接比较读数 `value` |
+| `window_seconds` | 事件时间窗口（> 0 的有限数值）；所有条件的最近命中须落在同一窗口内 |
+| `rule_id` | 可选自定义 id；重复 → 409 |
+
+```bash
+curl -s -X POST localhost:8000/sessions/lab-1/correlation-rules \
+  -H 'Content-Type: application/json' -d '{
+  "rule_id": "heat-and-dry",
+  "window_seconds": 30,
+  "conditions": [
+    {"source_id": "thermometer-a", "direction": "above", "threshold": 30.0},
+    {"source_id": "thermometer-b", "direction": "below", "threshold": 5.0, "value_key": "humidity"}
+  ]
+}'
+```
+
+响应 201，含规则定义与当前 `state`（`waiting`/`correlated`）。若相关来源此前已有
+已发布读数，创建时立即回放，可能直接返回 `correlated` 并生成历史事件。
+
+### 11. 查询复合规则
+
+- `GET /sessions/{session_id}/correlation-rules`：列出会话全部复合规则（含当前状态）。
+- `GET /sessions/{session_id}/correlation-rules/{rule_id}`：单条规则；不存在 → 404。
+
+### 12. 查询当前命中
+
+`GET /sessions/{session_id}/correlation-rules/{rule_id}/hits`
+
+返回每个条件的当前最近命中（`last_hit`，未命中过为 `null`）、整体是否满足
+（`satisfied`：所有条件都有命中且跨度在窗口内）、状态机状态 `state`、当前窗口边界
+`window_start`/`window_end`（有全部命中时给出）以及规则在归并流上消费到的位置。
+
+```bash
+curl -s 'localhost:8000/sessions/lab-1/correlation-rules/heat-and-dry/hits'
+```
+
+```json
+{
+  "rule_id": "heat-and-dry",
+  "session_id": "lab-1",
+  "state": "correlated",
+  "window_seconds": 30.0,
+  "satisfied": true,
+  "window_start": "2026-09-21T10:00:05Z",
+  "window_end": "2026-09-21T10:00:20Z",
+  "conditions": [
+    {"source_id": "thermometer-a", "direction": "above", "threshold": 30.0,
+     "value_key": null,
+     "last_hit": {"source_id": "thermometer-a", "seq": 1,
+                  "observed_at": "2026-09-21T10:00:05Z", "value": 31.5}},
+    {"source_id": "thermometer-b", "direction": "below", "threshold": 5.0,
+     "value_key": "humidity",
+     "last_hit": {"source_id": "thermometer-b", "seq": 2,
+                  "observed_at": "2026-09-21T10:00:20Z", "value": 3.1}}
+  ],
+  "last_observed_at": "2026-09-21T10:00:20Z",
+  "last_source_id": "thermometer-b",
+  "last_seq": 2
+}
+```
+
+### 13. 查询复合事件历史（分页）
+
+`GET /sessions/{session_id}/correlation-alerts/history?limit=100&cursor=...&rule_id=...`
+
+- 返回 `correlated_entered` 事件，**按事件 id 倒序（最新在前）**；
+- 每个事件含触发时的窗口边界与全部命中读数快照（`hits`）；
+- `next_cursor` 不透明游标，原样回传翻页；损坏游标 → 400；
+- 可选过滤：`rule_id`（不存在 → 404）。
+
+```bash
+curl -s 'localhost:8000/sessions/lab-1/correlation-alerts/history?limit=20'
+```
+
 ## 端到端示例（滞回 + 连续次数）
 
 规则：`above`，进入阈值 30、恢复阈值 25，连续进入 3 次、连续恢复 2 次。
@@ -249,6 +363,21 @@ curl -s 'localhost:8000/sessions/lab-1/alerts/history?limit=20&event_type=entere
 
 期间任何因迟到而被隔离的高温读数都不会触发或延长告警。
 
+## 端到端示例（跨来源复合）
+
+规则：温度计 A `above 30`、湿度计 B `below 5`（取 `value_key="humidity"`），窗口 30 秒。
+两个来源的读数同样只有在被水位线确定发布后才被消费：
+
+| 已发布读数（归并序） | 命中/状态 |
+| --- | --- |
+| A@10:00:05 = 31.5 | A 最近命中 = 10:00:05；B 未命中，仍 waiting |
+| B@10:00:20 humidity = 3.1 | B 最近命中 = 10:00:20；跨度 15s ≤ 30s → **correlated_entered**，转 correlated |
+| A@10:01:10 = 32.0 | A 命中更新为 10:01:10；与 B 跨度 50s > 30s → 静默回到 waiting |
+| B@10:01:25 humidity = 2.8 | B 命中更新为 10:01:25；跨度 15s ≤ 30s → 第二次 **correlated_entered** |
+
+若 A 的高温读数因迟到被隔离，它不会构成命中；只有 A 再发布一条窗口内的越限读数，
+规则才会再次进入 correlated。
+
 ## 项目结构
 
 ```
@@ -256,16 +385,18 @@ curl -s 'localhost:8000/sessions/lab-1/alerts/history?limit=20&event_type=entere
 ├── app/
 │   ├── main.py          # FastAPI 路由、异常映射
 │   ├── service.py       # 水位线计算 / 发布 / 隔离 / 幂等等核心逻辑
-│   ├── alerts.py        # 告警状态机、规则创建（回放）、当前/历史查询
+│   ├── alerts.py        # 单来源告警状态机、规则创建（回放）、当前/历史查询
+│   ├── correlations.py  # 跨来源复合规则、命中维护、correlated_entered 事件
 │   ├── errors.py        # 400/404/409 业务异常
 │   ├── cursor.py        # 不透明 keyset 分页游标
-│   ├── database.py      # SQLite schema、连接、BEGIN IMMEDIATE 事务
+│   ├── database.py      # SQLite schema、版本化迁移、BEGIN IMMEDIATE 事务
 │   ├── models.py        # Pydantic 请求/响应模型
 │   ├── time_utils.py    # ISO 8601 解析与 UTC 规范化
 │   └── config.py        # 环境变量配置
 ├── tests/
-│   ├── test_api.py      # 时间线/隔离/幂等等端到端行为测试（22 个）
-│   └── test_alerts.py   # 告警状态机/滞回/连续次数/隔离隔离/回放/分页测试（27 个）
+│   ├── test_api.py          # 时间线/隔离/幂等等端到端行为测试（22 个）
+│   ├── test_alerts.py       # 单来源告警状态机/滞回/连续次数/隔离/回放/分页（27 个）
+│   └── test_correlations.py # 复合规则/窗口对齐/超窗回退/隔离/回放/分页（26 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

@@ -233,3 +233,146 @@ class AlertHistoryResponse(BaseModel):
     session_id: str
     next_cursor: Optional[str] = None
     events: list[AlertEventOut]
+
+
+# ---------------------------------------------------------------------------
+# cross-source composite (correlated) alert rules
+# ---------------------------------------------------------------------------
+
+class CorrelationConditionIn(BaseModel):
+    source_id: str = Field(
+        ..., min_length=1, description="Fixed sensor source declared on the session"
+    )
+    direction: Literal["above", "below"] = Field(
+        ..., description="'above' hits on high values, 'below' on low values"
+    )
+    threshold: float = Field(
+        ..., description="Breach threshold; crossing it (strictly) records a hit"
+    )
+    value_key: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "Top-level key read from an object-valued reading; omit to compare the"
+            " reading value itself. Missing/non-numeric values never hit."
+        ),
+    )
+
+    @field_validator("source_id")
+    @classmethod
+    def _source_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("source_id must not be blank")
+        return v
+
+    @field_validator("threshold")
+    @classmethod
+    def _finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("threshold must be a finite number")
+        return v
+
+    @field_validator("value_key")
+    @classmethod
+    def _value_key_not_blank(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not v.strip():
+            raise ValueError("value_key must not be blank")
+        return v.strip() if v is not None else None
+
+
+class CreateCorrelationRuleIn(BaseModel):
+    conditions: list[CorrelationConditionIn] = Field(
+        ..., min_length=2, max_length=4,
+        description="2-4 per-source conditions, each on a distinct source",
+    )
+    window_seconds: float = Field(
+        ..., gt=0,
+        description=(
+            "Event-time window: all conditions' latest hits must fit within this"
+            " many seconds of each other (inclusive) to correlate"
+        ),
+    )
+    rule_id: Optional[str] = Field(None, min_length=1, description="Optional caller-chosen id")
+
+    @field_validator("conditions")
+    @classmethod
+    def _distinct_sources(cls, v: list[CorrelationConditionIn]) -> list[CorrelationConditionIn]:
+        sources = [c.source_id for c in v]
+        if len(set(sources)) != len(sources):
+            raise ValueError("conditions must reference distinct source_ids")
+        return v
+
+    @field_validator("window_seconds")
+    @classmethod
+    def _window_finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("window_seconds must be a finite number")
+        return v
+
+
+class CorrelationConditionOut(BaseModel):
+    source_id: str
+    direction: Literal["above", "below"]
+    threshold: float
+    value_key: Optional[str] = None
+
+
+class CorrelationRuleOut(BaseModel):
+    rule_id: str
+    session_id: str
+    window_seconds: float
+    conditions: list[CorrelationConditionOut]
+    state: Literal["waiting", "correlated"]
+    created_at: str
+
+
+class CorrelationRulesResponse(BaseModel):
+    session_id: str
+    rules: list[CorrelationRuleOut]
+
+
+class CorrelationHitOut(BaseModel):
+    source_id: str
+    seq: int
+    observed_at: str
+    value: float
+
+
+class CorrelationConditionStatusOut(BaseModel):
+    source_id: str
+    direction: Literal["above", "below"]
+    threshold: float
+    value_key: Optional[str] = None
+    last_hit: Optional[CorrelationHitOut] = None
+
+
+class CorrelationHitsResponse(BaseModel):
+    rule_id: str
+    session_id: str
+    state: Literal["waiting", "correlated"]
+    window_seconds: float
+    satisfied: bool
+    window_start: Optional[str] = None
+    window_end: Optional[str] = None
+    conditions: list[CorrelationConditionStatusOut]
+    last_observed_at: Optional[str] = None
+    last_source_id: Optional[str] = None
+    last_seq: Optional[int] = None
+
+
+class CorrelationEventOut(BaseModel):
+    id: int
+    rule_id: str
+    session_id: str
+    event_type: Literal["correlated_entered"]
+    window_seconds: float
+    window_start: str
+    window_end: str
+    hits: list[CorrelationHitOut]
+    triggered_at: str
+
+
+class CorrelationHistoryResponse(BaseModel):
+    session_id: str
+    next_cursor: Optional[str] = None
+    events: list[CorrelationEventOut]

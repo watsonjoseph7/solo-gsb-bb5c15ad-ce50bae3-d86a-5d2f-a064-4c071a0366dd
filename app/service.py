@@ -277,12 +277,15 @@ def ingest_batch(
             published_wm = new_wm
             if published_now:
                 # Deterministically-published readings are the *only* input to
-                # the per-source alert state machines; buffered readings that
-                # merely became published in this batch drive it, in timeline
-                # order, inside the same serialised write transaction.
+                # the per-source alert state machines and the cross-source
+                # correlation machines; readings that became published in this
+                # batch drive them, in timeline order, inside the same
+                # serialised write transaction.
                 from .alerts import advance_alerts
+                from .correlations import advance_correlations
 
                 advance_alerts(conn, session_id, new_wm, received_at)
+                advance_correlations(conn, session_id, new_wm, received_at)
 
         published_total = conn.execute(
             "SELECT COUNT(*) AS c FROM readings WHERE session_id = ? AND status = 'published'",

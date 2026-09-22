@@ -47,7 +47,7 @@ EVENT_TYPES = ("entered", "recovered")
 # pure state machine
 # ---------------------------------------------------------------------------
 
-def _is_breach(direction: str, value: float, threshold: float) -> bool:
+def is_breach(direction: str, value: float, threshold: float) -> bool:
     """Strictly beyond the enter threshold (boundary equality does not count)."""
     return value > threshold if direction == "above" else value < threshold
 
@@ -88,7 +88,7 @@ def transition(
         return STATE_ACTIVE, 0, None
 
     # state == normal
-    if _is_breach(direction, value, enter_threshold):
+    if is_breach(direction, value, enter_threshold):
         nxt = streak + 1
         if nxt >= enter_consecutive:
             return STATE_ACTIVE, 0, "entered"
@@ -96,7 +96,7 @@ def transition(
     return STATE_NORMAL, 0, None
 
 
-def _extract_value(payload: Optional[str], value_key: Optional[str]) -> Optional[float]:
+def extract_value(payload: Optional[str], value_key: Optional[str]) -> Optional[float]:
     """Pull a finite, non-boolean number out of the stored JSON payload.
 
     With ``value_key=None`` the reading value itself must be numeric;
@@ -330,7 +330,7 @@ def _apply_reading(
     triggered_at: str,
 ) -> None:
     """Evaluate one published reading against one rule and persist the result."""
-    value = _extract_value(reading["payload"], rule["value_key"])
+    value = extract_value(reading["payload"], rule["value_key"])
     new_state, new_streak, event_type = transition(
         rule["state"],
         rule["streak"],
