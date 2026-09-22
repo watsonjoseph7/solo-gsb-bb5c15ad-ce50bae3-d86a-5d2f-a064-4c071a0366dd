@@ -281,8 +281,12 @@ def ingest_batch(
                 # merely became published in this batch drive it, in timeline
                 # order, inside the same serialised write transaction.
                 from .alerts import advance_alerts
+                from .correlated import advance_correlated
 
                 advance_alerts(conn, session_id, new_wm, received_at)
+                # Cross-source rules consume the global merge order (every
+                # session source advances event time and can expire a window).
+                advance_correlated(conn, session_id, new_wm, received_at)
 
         published_total = conn.execute(
             "SELECT COUNT(*) AS c FROM readings WHERE session_id = ? AND status = 'published'",

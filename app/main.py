@@ -8,17 +8,22 @@ from typing import Any, Optional
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import alerts, service
+from . import alerts, correlated, service
 from .config import settings
 from .database import get_db, init_db
 from .models import (
     AlertHistoryResponse,
     AlertRuleOut,
     AlertRulesResponse,
+    CorrelatedHistoryResponse,
+    CorrelatedRuleOut,
+    CorrelatedRulesResponse,
     CreateAlertRuleIn,
+    CreateCorrelatedRuleIn,
     CreateSessionIn,
     CreatedSessionResponse,
     CurrentAlertsResponse,
+    CurrentCorrelatedAlertsResponse,
     PullResponse,
     QuarantineResponse,
     ReadingIn,
@@ -37,13 +42,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lab Sensor Timeline Merge API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "Out-of-order sensor reporting with per-session fixed source lists, "
         "a slowest-source watermark (minus allowed lateness), deterministic "
         "publish order and late-reading quarantine. Published readings also "
         "drive per-source threshold alert state machines (enter / active / "
-        "recovered) with hysteresis and consecutive-count debouncing."
+        "recovered) with hysteresis and consecutive-count debouncing, plus "
+        "cross-source correlated rules that fire once when 2-4 sources breach "
+        "their own thresholds together inside a shared event-time window."
     ),
     lifespan=lifespan,
 )
@@ -282,4 +289,98 @@ def alert_history(
         **alerts.list_event_history(
             conn, session_id, limit, cursor, source_id, rule_id, event_type
         )
+    )
+
+
+# ---------------------------------------------------------------------------
+# cross-source correlated alerts
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/sessions/{session_id}/correlated-rules",
+    response_model=CorrelatedRuleOut,
+    status_code=201,
+    tags=["correlated-alerts"],
+)
+def create_correlated_rule(
+    session_id: str,
+    body: CreateCorrelatedRuleIn,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CorrelatedRuleOut:
+    """Create a cross-source correlated alert rule (2-4 conditions).
+
+    Every condition binds one distinct declared source to a direction, a
+    strict threshold, an optional ``value_key`` and its own
+    ``window_seconds``.  The merged published stream is replayed on creation,
+    so the rule's initial state is independent of when it was created.
+    Unknown sources return 400; duplicate sources or a condition count
+    outside 2-4 return 422.
+    """
+    result = correlated.create_rule(
+        conn,
+        session_id=session_id,
+        conditions=[c.model_dump() for c in body.conditions],
+        rule_id=body.rule_id,
+    )
+    return CorrelatedRuleOut(**result)
+
+
+@app.get(
+    "/sessions/{session_id}/correlated-rules",
+    response_model=CorrelatedRulesResponse,
+    tags=["correlated-alerts"],
+)
+def list_correlated_rules(
+    session_id: str,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CorrelatedRulesResponse:
+    return CorrelatedRulesResponse(
+        session_id=session_id, rules=correlated.list_rules(conn, session_id)
+    )
+
+
+@app.get(
+    "/sessions/{session_id}/correlated-rules/{rule_id}",
+    response_model=CorrelatedRuleOut,
+    tags=["correlated-alerts"],
+)
+def get_correlated_rule(
+    session_id: str,
+    rule_id: str,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CorrelatedRuleOut:
+    return CorrelatedRuleOut(**correlated.get_rule(conn, session_id, rule_id))
+
+
+@app.get(
+    "/sessions/{session_id}/correlated-alerts/current",
+    response_model=CurrentCorrelatedAlertsResponse,
+    tags=["correlated-alerts"],
+)
+def current_correlated_alerts(
+    session_id: str,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CurrentCorrelatedAlertsResponse:
+    """Correlated rules currently satisfied (``correlated`` state)."""
+    return CurrentCorrelatedAlertsResponse(
+        session_id=session_id,
+        alerts=correlated.list_current(conn, session_id),
+    )
+
+
+@app.get(
+    "/sessions/{session_id}/correlated-alerts/history",
+    response_model=CorrelatedHistoryResponse,
+    tags=["correlated-alerts"],
+)
+def correlated_alert_history(
+    session_id: str,
+    limit: int = Query(100, ge=1, le=1000),
+    cursor: Optional[str] = Query(None, description="Opaque next_cursor from a previous page"),
+    rule_id: Optional[str] = Query(None, description="Filter by correlated rule"),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CorrelatedHistoryResponse:
+    """``correlated_entered`` events, newest first, with keyset pagination."""
+    return CorrelatedHistoryResponse(
+        **correlated.list_event_history(conn, session_id, limit, cursor, rule_id)
     )

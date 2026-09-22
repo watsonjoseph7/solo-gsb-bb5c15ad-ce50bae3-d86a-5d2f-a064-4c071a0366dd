@@ -1,15 +1,19 @@
-"""SQLite persistence: schema, connection lifecycle and transactions."""
+"""SQLite persistence: schema, migrations, connection lifecycle and transactions."""
 from __future__ import annotations
 
 import os
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from fastapi import Request
 
-SCHEMA = """
+# The v0 schema creates every table that existed before versioned migrations
+# were introduced.  It stays idempotent (``CREATE TABLE IF NOT EXISTS``) so
+# brand-new databases are bootstrapped straight from it; subsequent schema
+# changes live in :data:`MIGRATIONS` and are applied one version at a time.
+SCHEMA_V0 = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id                TEXT PRIMARY KEY,
     source_ids                TEXT NOT NULL,          -- JSON array, canonical order
@@ -98,6 +102,98 @@ CREATE INDEX IF NOT EXISTS idx_alert_events_session
 """
 
 
+# ---------------------------------------------------------------------------
+# versioned migrations (applied on startup, each exactly once per database)
+# ---------------------------------------------------------------------------
+
+def _migration_1(conn: sqlite3.Connection, applied_at: str) -> None:
+    """Cross-source correlated alert rules (2-4 sources, per-condition window).
+
+    Runs inside the ``BEGIN IMMEDIATE`` transaction opened by :func:`init_db`
+    (individual ``execute`` calls, not ``executescript`` which would commit it).
+    """
+    conn.execute(
+        """
+CREATE TABLE correlated_rules (
+    rule_id                     TEXT PRIMARY KEY,
+    session_id                  TEXT NOT NULL REFERENCES sessions(session_id),
+    created_at                  TEXT NOT NULL,
+    state                       TEXT NOT NULL DEFAULT 'waiting'
+                                    CHECK (state IN ('waiting','correlated')),
+    -- Event-time position of the last published reading evaluated, in global
+    -- (cross-source) merge order (observed_at, source_id, seq).
+    last_observed_at            TEXT,
+    last_source_id              TEXT,
+    last_seq                    INTEGER,
+    -- Set while correlated: the reading that completed the last correlation.
+    correlated_since_observed_at TEXT,
+    correlated_since_source_id   TEXT,
+    correlated_since_seq         INTEGER
+)
+"""
+    )
+    conn.execute(
+        "CREATE INDEX idx_correlated_rules_session"
+        " ON correlated_rules (session_id)"
+    )
+    conn.execute(
+        """
+CREATE TABLE correlated_conditions (
+    rule_id      TEXT NOT NULL REFERENCES correlated_rules(rule_id),
+    position     INTEGER NOT NULL,              -- merge-declaration order, 0-based
+    source_id    TEXT NOT NULL,
+    direction    TEXT NOT NULL CHECK (direction IN ('above','below')),
+    threshold    REAL NOT NULL,
+    value_key    TEXT,                           -- NULL => the reading value itself
+    window_seconds REAL NOT NULL,
+    -- Most recent in-window breach ("hit") seen for this condition.
+    last_hit_observed_at TEXT,
+    last_hit_seq         INTEGER,
+    last_hit_value       REAL,
+    PRIMARY KEY (rule_id, position)
+)
+"""
+    )
+    # Every condition is fetched for a rule on each published reading.
+    conn.execute(
+        "CREATE INDEX idx_correlated_conditions_rule"
+        " ON correlated_conditions (rule_id)"
+    )
+    conn.execute(
+        """
+CREATE TABLE correlated_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,  -- stable chronological id
+    rule_id      TEXT NOT NULL REFERENCES correlated_rules(rule_id),
+    session_id   TEXT NOT NULL,
+    event_type   TEXT NOT NULL CHECK (event_type IN ('correlated_entered')),
+    -- The reading whose evaluation completed the correlation.
+    completed_by_source_id  TEXT NOT NULL,
+    completed_by_seq        INTEGER NOT NULL,
+    completed_by_observed_at TEXT NOT NULL,
+    -- Per-condition hit snapshot at completion (JSON: position-indexed list).
+    hits         TEXT NOT NULL,
+    triggered_at TEXT NOT NULL,                    -- wall-clock production time
+    -- The same completing reading can only complete the rule once.
+    UNIQUE (rule_id, completed_by_source_id, completed_by_seq)
+)
+"""
+    )
+    conn.execute(
+        "CREATE INDEX idx_correlated_events_session"
+        " ON correlated_events (session_id, id)"
+    )
+    conn.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (1, ?)",
+        (applied_at,),
+    )
+
+
+MIGRATIONS: dict[int, Callable[[sqlite3.Connection, str], None]] = {
+    1: _migration_1,
+}
+LATEST_VERSION = max(MIGRATIONS)
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -113,13 +209,42 @@ def connect(db_path: str) -> sqlite3.Connection:
 
 
 def init_db(db_path: str) -> None:
-    """Create the database directory and schema. Safe to call repeatedly."""
+    """Create the database directory, base schema and pending migrations.
+
+    Safe to call repeatedly: the v0 schema is created idempotently and each
+    numbered migration runs at most once (recorded in ``schema_migrations``).
+    An existing database from an earlier release therefore upgrades in place
+    without losing any data.
+    """
+    from .time_utils import store_event_time
+
     parent = os.path.dirname(os.path.abspath(db_path))
     os.makedirs(parent, exist_ok=True)
     conn = connect(db_path)
     try:
-        conn.executescript(SCHEMA)
-        conn.commit()
+        # Bootstrap the complete base schema (no-ops on existing databases).
+        conn.executescript(SCHEMA_V0)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            " version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        applied = {
+            r["version"]
+            for r in conn.execute("SELECT version FROM schema_migrations")
+        }
+        for version in sorted(MIGRATIONS):
+            if version in applied:
+                continue
+            # Each migration is one serialised unit: its DDL and the ledger
+            # insert commit together, so a crash before completion leaves the
+            # version unrecorded and the (idempotent) migration re-runnable.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                MIGRATIONS[version](conn, store_event_time(utc_now()))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
     finally:
         conn.close()
 
